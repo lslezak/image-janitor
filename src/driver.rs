@@ -6,6 +6,8 @@ use log::{debug, info, warn};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Instant;
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -50,13 +52,14 @@ pub fn cleanup_drivers(
     config_paths: &[&str],
     module_dir: &Path,
     delete: bool,
-    runner: &dyn CommandRunner,
+    runner: &(dyn CommandRunner + Sync),
 ) -> Result<(), JanitorError> {
     let (to_keep_re, to_delete_re) = config::read_config(config_paths, runner)?;
     let kernel_dir = util::find_kernel_dir(module_dir)?;
     info!("Scanning kernel modules in {}", kernel_dir.display());
 
-    let mut driver_map = HashMap::new();
+    let start = Instant::now();
+    let mut module_paths = Vec::new();
     for entry in WalkDir::new(&kernel_dir) {
         let entry = entry?;
         let path = entry.path();
@@ -67,10 +70,37 @@ pub fn cleanup_drivers(
                 path.to_str().is_some_and(|s| s.ends_with(".ko.zst"))
             )
         {
-            let driver = Driver::from_file(path, runner)?;
-            driver_map.insert(driver.name.clone(), driver);
+            module_paths.push(path.to_path_buf());
         }
     }
+
+    let num_threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    info!("Running {} threads", num_threads);
+
+    let chunk_size = std::cmp::max(1, (module_paths.len() + num_threads - 1) / num_threads);
+
+    let driver_map = thread::scope(|s| {
+        let mut handles = Vec::new();
+        for chunk in module_paths.chunks(chunk_size) {
+            handles.push(s.spawn(move || {
+                let mut chunk_map = HashMap::new();
+                for path in chunk {
+                    let driver = Driver::from_file(path, runner)?;
+                    chunk_map.insert(driver.name.clone(), driver);
+                }
+                Ok::<HashMap<String, Driver>, JanitorError>(chunk_map)
+            }));
+        }
+
+        let mut final_map = HashMap::new();
+        for handle in handles {
+            match handle.join() {
+                Ok(res) => final_map.extend(res?),
+                Err(e) => std::panic::resume_unwind(e),
+            }
+        }
+        Ok::<HashMap<String, Driver>, JanitorError>(final_map)
+    })?;
 
     let mut to_keep: HashSet<Driver> = HashSet::new();
 
@@ -94,7 +124,7 @@ pub fn cleanup_drivers(
                 // If the dependency was not already in to_keep, add it and
                 // put it on the worklist to process its dependencies.
                 if to_keep.insert(dep_driver.clone()) {
-                    info!("Keep dependant driver {}", dep_driver.path.display());
+                    debug!("Keep dependant driver {}", dep_driver.path.display());
                     worklist.push(dep_driver.clone());
                 }
             }
@@ -105,14 +135,17 @@ pub fn cleanup_drivers(
         .filter(|d| !to_keep.contains(d))
         .collect();
 
+    debug!("Driver scan and dependency check took {:?}", start.elapsed());
     info!("Found {} drivers to delete", to_delete.len());
     debug!("Drivers to delete: {:?}", to_delete.iter().map(|d| &d.path).collect::<Vec<_>>());
 
     if delete {
+        let start = Instant::now();
         for driver in to_delete {
             info!("Deleting {}", driver.path.display());
             fs::remove_file(&driver.path)?;
         }
+        debug!("Deleting files took {:?}", start.elapsed());
     }
 
     Ok(())

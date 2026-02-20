@@ -6,6 +6,8 @@ use path_clean::PathClean;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Instant;
 use walkdir::WalkDir;
 
 fn find_kernel_modules(kernel_dir: &Path) -> Result<Vec<PathBuf>, JanitorError> {
@@ -68,22 +70,50 @@ fn find_firmware_files_from_name(
 fn get_required_firmware(
     kernel_dir: &Path,
     fw_dir: &Path,
-    runner: &dyn CommandRunner,
+    runner: &(dyn CommandRunner + Sync),
 ) -> Result<HashSet<PathBuf>, JanitorError> {
-    let mut required = HashSet::new();
     let kernel_modules = find_kernel_modules(kernel_dir)?;
 
-    for module_path in kernel_modules {
-        let firmware_names = get_firmware_deps_for_module(&module_path, runner)?;
-        for fw_name in firmware_names {
-            let firmware_files = find_firmware_files_from_name(&fw_name, fw_dir)?;
-            for fw_file in firmware_files {
-                let symlinks = resolve_symlinks(&fw_file, fw_dir)?;
-                required.extend(symlinks);
+    if kernel_modules.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let num_threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    info!("Running {} threads", num_threads);
+
+    // compute how much modules to process per thread
+    let chunk_size = (kernel_modules.len() + num_threads - 1) / num_threads;
+
+    let results = thread::scope(|s| {
+        let mut handles = Vec::new();
+        for chunk in kernel_modules.chunks(chunk_size) {
+            handles.push(s.spawn(move || {
+                let mut chunk_required = HashSet::new();
+                for module_path in chunk {
+                    let firmware_names = get_firmware_deps_for_module(module_path, runner)?;
+                    for fw_name in firmware_names {
+                        let firmware_files = find_firmware_files_from_name(&fw_name, fw_dir)?;
+                        for fw_file in firmware_files {
+                            let symlinks = resolve_symlinks(&fw_file, fw_dir)?;
+                            chunk_required.extend(symlinks);
+                        }
+                    }
+                }
+                Ok::<HashSet<PathBuf>, JanitorError>(chunk_required)
+            }));
+        }
+
+        let mut final_required = HashSet::new();
+        for handle in handles {
+            match handle.join() {
+                Ok(res) => final_required.extend(res?),
+                Err(e) => std::panic::resume_unwind(e),
             }
         }
-    }
-    Ok(required)
+        Ok::<HashSet<PathBuf>, JanitorError>(final_required)
+    })?;
+
+    Ok(results)
 }
 
 fn resolve_symlinks(path: &Path, base_dir: &Path) -> Result<Vec<PathBuf>, JanitorError> {
@@ -197,12 +227,14 @@ pub fn cleanup_firmware(
     module_dir: &Path,
     fw_dir: &Path,
     delete: bool,
-    runner: &dyn CommandRunner,
+    runner: &(dyn CommandRunner + Sync),
 ) -> Result<(), JanitorError> {
     let kernel_dir = util::find_kernel_dir(module_dir)?;
     info!("Scanning kernel modules in {}", kernel_dir.display());
 
+    let start = Instant::now();
     let required_fw_abs = get_required_firmware(&kernel_dir, fw_dir, runner)?;
+    debug!("Firmware scanned in {:?}", start.elapsed());
     let required_fw: HashSet<_> = required_fw_abs.into_iter()
         .map(|p| p.strip_prefix(fw_dir).unwrap().to_path_buf())
         .collect();
@@ -210,11 +242,16 @@ pub fn cleanup_firmware(
     let unused_size = remove_unused_files(fw_dir, &required_fw, delete)?;
 
     if delete {
+        let start = Instant::now();
         remove_dangling_symlinks(fw_dir)?;
+        debug!("Dangling symlinks removed in {:?}", start.elapsed());
+
+        let start = Instant::now();
         remove_empty_directories(fw_dir)?;
+        debug!("Empty directories removed in {:?}", start.elapsed());
     }
 
-    info!("Potential savings: {} ({} MiB)", unused_size, unused_size >> 20);
+    info!("Potential savings: {} bytes ({} MiB)", unused_size, unused_size >> 20);
 
     Ok(())
 }
