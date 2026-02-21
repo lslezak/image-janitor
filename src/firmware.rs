@@ -79,10 +79,10 @@ fn get_required_firmware(
     }
 
     let num_threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-    info!("Running {} threads", num_threads);
+    info!("Using {} threads", num_threads);
 
     // compute how much modules to process per thread
-    let chunk_size = (kernel_modules.len() + num_threads - 1) / num_threads;
+    let chunk_size = kernel_modules.len().div_ceil(num_threads);
 
     let results = thread::scope(|s| {
         let mut handles = Vec::new();

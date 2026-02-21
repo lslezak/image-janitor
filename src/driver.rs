@@ -75,9 +75,9 @@ pub fn cleanup_drivers(
     }
 
     let num_threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-    info!("Running {} threads", num_threads);
+    info!("Using {} threads", num_threads);
 
-    let chunk_size = std::cmp::max(1, (module_paths.len() + num_threads - 1) / num_threads);
+    let chunk_size = std::cmp::max(1, module_paths.len().div_ceil(num_threads));
 
     let driver_map = thread::scope(|s| {
         let mut handles = Vec::new();
