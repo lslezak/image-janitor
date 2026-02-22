@@ -7,7 +7,6 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Instant;
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -19,7 +18,10 @@ struct Driver {
 
 impl Driver {
     fn from_file(path: &Path, runner: &dyn CommandRunner) -> Result<Self, JanitorError> {
-        let deps_str = match runner.run("/usr/sbin/modinfo", &["-F", "depends", path.to_str().unwrap()]) {
+        let deps_str = match runner.run(
+            "/usr/sbin/modinfo",
+            &["-F", "depends", path.to_str().unwrap()],
+        ) {
             Ok(s) => s,
             Err(e) => {
                 warn!("modinfo for {} failed: {}", path.display(), e);
@@ -44,7 +46,11 @@ impl Driver {
             .unwrap()
             .to_string();
 
-        Ok(Driver { name, path: path.to_path_buf(), deps })
+        Ok(Driver {
+            name,
+            path: path.to_path_buf(),
+            deps,
+        })
     }
 }
 
@@ -58,24 +64,23 @@ pub fn cleanup_drivers(
     let kernel_dir = util::find_kernel_dir(module_dir)?;
     info!("Scanning kernel modules in {}", kernel_dir.display());
 
-    let start = Instant::now();
     let mut module_paths = Vec::new();
     for entry in WalkDir::new(&kernel_dir) {
         let entry = entry?;
         let path = entry.path();
         if path.is_file()
-            && (
-                path.extension().is_some_and(|e| e == "ko") ||
-                path.to_str().is_some_and(|s| s.ends_with(".ko.xz")) ||
-                path.to_str().is_some_and(|s| s.ends_with(".ko.zst"))
-            )
+            && (path.extension().is_some_and(|e| e == "ko")
+                || path.to_str().is_some_and(|s| s.ends_with(".ko.xz"))
+                || path.to_str().is_some_and(|s| s.ends_with(".ko.zst")))
         {
             module_paths.push(path.to_path_buf());
         }
     }
 
-    let num_threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-    info!("Using {} threads", num_threads);
+    let num_threads = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    info!("Using {} threads for scanning kernel modules", num_threads);
 
     let chunk_size = std::cmp::max(1, module_paths.len().div_ceil(num_threads));
 
@@ -105,7 +110,11 @@ pub fn cleanup_drivers(
     let mut to_keep: HashSet<Driver> = HashSet::new();
 
     for driver in driver_map.values() {
-        let kernel_path = driver.path.strip_prefix(&kernel_dir).unwrap().to_str()
+        let kernel_path = driver
+            .path
+            .strip_prefix(&kernel_dir)
+            .unwrap()
+            .to_str()
             .ok_or_else(|| JanitorError::InvalidPath(driver.path.clone()))?;
 
         if to_delete_re.iter().any(|r| r.is_match(kernel_path)) {
@@ -131,21 +140,29 @@ pub fn cleanup_drivers(
         }
     }
 
-    let to_delete: Vec<_> = driver_map.values()
+    let to_delete: Vec<_> = driver_map
+        .values()
         .filter(|d| !to_keep.contains(d))
         .collect();
 
-    debug!("Driver scan and dependency check took {:?}", start.elapsed());
     info!("Found {} drivers to delete", to_delete.len());
-    debug!("Drivers to delete: {:?}", to_delete.iter().map(|d| &d.path).collect::<Vec<_>>());
+    debug!(
+        "Drivers to delete: {:?}",
+        to_delete.iter().map(|d| &d.path).collect::<Vec<_>>()
+    );
 
     if delete {
-        let start = Instant::now();
+        let mut deleted_size = 0;
         for driver in to_delete {
-            info!("Deleting {}", driver.path.display());
+            debug!("Deleting {}", driver.path.display());
+            deleted_size += fs::metadata(&driver.path)?.len();
             fs::remove_file(&driver.path)?;
         }
-        debug!("Deleting files took {:?}", start.elapsed());
+        info!(
+            "Deleted drivers: {} bytes ({} MiB)",
+            deleted_size,
+            deleted_size >> 20
+        );
     }
 
     Ok(())
@@ -169,7 +186,10 @@ mod tests {
             } else {
                 format!("{} {}", command, args.join(" "))
             };
-            self.responses.get(&key).cloned().ok_or(JanitorError::Command(format!("Not mocked: {}", key)))
+            self.responses
+                .get(&key)
+                .cloned()
+                .ok_or(JanitorError::Command(format!("Not mocked: {}", key)))
         }
     }
 
