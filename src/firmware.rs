@@ -210,7 +210,8 @@ fn remove_empty_directories(fw_dir: &Path) -> Result<(), JanitorError> {
     let mut dirs_to_check: Vec<PathBuf> = WalkDir::new(fw_dir)
         .into_iter()
         .filter_map(Result::ok)
-        .filter(|e| e.path().is_dir())
+        // ignore symlinks, they are processed separately
+        .filter(|e| e.path().is_dir() && !e.path().is_symlink())
         .map(|e| e.path().to_path_buf())
         .collect();
 
@@ -250,6 +251,8 @@ pub fn cleanup_firmware(
     if delete {
         remove_dangling_symlinks(fw_dir)?;
         remove_empty_directories(fw_dir)?;
+        // removing empty directories might create dangling symlinks, so run the removal again
+        remove_dangling_symlinks(fw_dir)?;
     }
 
     info!(
